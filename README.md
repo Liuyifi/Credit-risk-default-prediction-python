@@ -133,6 +133,12 @@ ROC-AUC measures ranking performance across thresholds. Precision measures the o
 
 The `0.15` threshold is used to demonstrate the relationship between review volume, precision, and recall. It was not selected using real lending costs or operational constraints.
 
+### Threshold trade-off
+
+The threshold trade-off chart shows how flagged share, precision, recall, and F1 change as the classification cutoff moves. The selected `0.15` threshold narrows the review group while keeping the precision and recall trade-off explicit.
+
+![Threshold trade-off curve](outputs/figures/threshold_tradeoff_curve.png)
+
 ![ROC curve](outputs/figures/roc_curve.png)
 
 Detailed outputs:
