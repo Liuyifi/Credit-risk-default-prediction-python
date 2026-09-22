@@ -1,6 +1,24 @@
+# Python environments and caches
 .venv/
+venv/
 __pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local configuration and secrets
+.env
+.env.*
+
+# macOS metadata
 .DS_Store
-data/raw/*.csv
-data/processed/*.csv
-outputs/
+
+# Raw datasets are stored locally
+data/raw/*
+!data/raw/README.md
+
+# Generated processed datasets
+data/processed/*
+!data/processed/.gitkeep
+
+# Local interview preparation; not part of the public portfolio repository
+docs/interview_notes.md
