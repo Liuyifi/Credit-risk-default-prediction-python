@@ -207,7 +207,7 @@ credit-risk-default-prediction-python/
 │   └── raw/
 │       └── README.md
 ├── docs/
-│   └── project_reflection.md
+│   └── project_notes.md
 ├── notebooks/
 │   └── 01_credit_risk_default_prediction.ipynb
 ├── outputs/
