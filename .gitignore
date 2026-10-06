@@ -16,9 +16,5 @@ __pycache__/
 data/raw/*
 !data/raw/README.md
 
-# Generated processed datasets
-data/processed/*
-!data/processed/.gitkeep
-
 # Local interview preparation; not part of the public portfolio repository
 docs/interview_notes.md
