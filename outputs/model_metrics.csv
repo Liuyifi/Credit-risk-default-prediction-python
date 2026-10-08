@@ -1,2 +1,0 @@
-full_sample_payment_difficulty_rate,holdout_payment_difficulty_rate,roc_auc,gini,classification_threshold,precision,recall,f1_score,true_negatives,false_positives,false_negatives,true_positives
-0.08072881945686496,0.08072776937710356,0.6522221256817105,0.3044442513634209,0.15,0.18626752197671656,0.15790533736153073,0.170917811205581,53113,3425,4181,784

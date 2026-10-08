@@ -1,0 +1,7 @@
+source,row_count,column_count,grain_key,missing_key_rows,duplicate_grain_rows,temporal_field,temporal_min,temporal_max,temporal_excluded_rows,coverage_rate,coverage_definition
+application_train.csv,307511,122,SK_ID_CURR,0,0,not applicable,,,0,,not applicable
+HomeCredit_columns_description.csv,219,5,data dictionary row,0,0,not applicable,,,0,,not applicable
+bureau.csv,1716428,17,SK_ID_BUREAU,0,0,DAYS_CREDIT / DAYS_CREDIT_UPDATE,-41947.0,372.0,17,0.8568506492450677,train borrowers represented / application borrowers
+bureau_balance.csv,27299925,3,SK_ID_BUREAU+MONTHS_BALANCE,0,0,MONTHS_BALANCE,-96.0,0.0,0,0.29992748226892696,train borrowers represented through eligible bureau records / application borrowers
+previous_application.csv,1670214,37,SK_ID_PREV,0,0,DAYS_DECISION,-2922.0,-1.0,0,0.9464929709831518,train borrowers represented / application borrowers
+installments_payments.csv,13605401,8,SK_ID_CURR+SK_ID_PREV+NUM_INSTALMENT_VERSION+NUM_INSTALMENT_NUMBER,0,1294388,DAYS_INSTALMENT / DAYS_ENTRY_PAYMENT,-4921.0,-1.0,2905,0.9483985938714388,train borrowers represented / application borrowers

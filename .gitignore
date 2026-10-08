@@ -16,5 +16,14 @@ __pycache__/
 data/raw/*
 !data/raw/README.md
 
+# Rebuildable borrower-level data, split IDs, and development artifacts
+data/processed/*
+!data/processed/README.md
+
+# Local fitted models and caches are not portfolio artifacts
+models/
+*.pkl
+*.joblib
+
 # Local interview preparation; not part of the public portfolio repository
 docs/interview_notes.md

@@ -1,10 +1,16 @@
-# Raw Data
+# Raw data
 
-Raw CSV files are not uploaded to GitHub.
+Raw Home Credit files are stored locally and are not committed to Git.
 
-Download the data from the [Kaggle Home Credit Default Risk data page](https://www.kaggle.com/competitions/home-credit-default-risk/data) and place the CSV files in `data/raw/`:
+Download these files from the [Home Credit Default Risk data page](https://www.kaggle.com/competitions/home-credit-default-risk/data) and place them directly in this directory:
 
-- `application_train.csv`: required for the first version of this project.
-- `HomeCredit_columns_description.csv`: optional, used only for field descriptions in the notebook.
+- `application_train.csv`
+- `HomeCredit_columns_description.csv`
+- `bureau.csv`
+- `bureau_balance.csv`
+- `previous_application.csv`
+- `installments_payments.csv`
 
-This project intentionally uses only `application_train.csv` for modeling in the first version. Do not move or rename the CSV files after placing them in `data/raw/`.
+The rebuild intentionally omits `POS_CASH_balance.csv` and `credit_card_balance.csv`. Four relational sources are enough to demonstrate external credit history, prior applications, and repayment behaviour without creating an uncontrolled feature dump.
+
+The notebooks expect the filenames above and validate their schemas before feature construction. Do not rename the files.

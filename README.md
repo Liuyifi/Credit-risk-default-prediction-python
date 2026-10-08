@@ -1,134 +1,114 @@
 # Credit Risk Default Prediction
 
-This project uses Home Credit's `application_train.csv` to build an interpretable Logistic Regression baseline for payment-difficulty risk ranking. It covers data checks, a small set of engineered features, an `80/20` train/holdout split, and holdout evaluation.
+This project tests how much pre-application credit and repayment history improves prediction of Home Credit's payment-difficulty outcome beyond application characteristics alone. The outcome is the competition label, not a Basel, legal, lifetime-default, or production PD definition.
 
-The holdout ROC-AUC is about `0.652`, so the model is only a modest baseline. At an illustrative threshold of `0.15`, it identifies a small High Risk group with an observed payment-difficulty rate of about `18.6%`, compared with the `8.1%` holdout baseline.
+## Data scope
 
-[View the analysis notebook](notebooks/01_credit_risk_default_prediction.ipynb) · [Read the project notes](docs/project_notes.md)
+The analysis uses 307,511 applications (24,825 events; 8.1%) and four relational sources: bureau records, monthly bureau status, previous applications, and installment payments. Raw CSVs stay local. The feature build enforces a day/month-0 cutoff and produces one row per `SK_ID_CURR`.
 
-## Key results
+Temporal checks excluded 17 bureau rows with a post-application credit update and 2,905 installment rows whose actual payment date was missing. Previous applications all occurred before day 0; bureau-balance months were all non-positive. Multiple payment rows for one scheduled installment are consolidated before borrower aggregation.
 
-| Holdout result | Value |
-| --- | ---: |
-| Observed payment-difficulty rate | 8.1% |
-| ROC-AUC | 0.652 |
-| Implied Gini (`2 × ROC-AUC - 1`) | 0.304 |
-| Illustrative threshold | 0.15 |
-| High Risk applicants | 4,209 of 61,503 (6.8%) |
-| High Risk observed payment-difficulty rate / precision | 18.6% |
-| Recall | 15.8% |
-| F1-score | 17.1% |
-| High Risk lift versus holdout baseline | 2.3× |
+## Feature architecture
 
-The model is only a modest baseline. The `0.15` cutoff is an illustrative threshold, not an optimized lending cutoff.
+The final candidate set has 98 predictors:
 
-## Data and features
+| Family | Features |
+|---|---:|
+| Application and affordability | 23 |
+| Bureau credit history | 19 |
+| Bureau monthly status | 12 |
+| Previous applications | 22 |
+| Installment behaviour | 22 |
 
-The data comes from the [Home Credit Default Risk competition](https://www.kaggle.com/competitions/home-credit-default-risk/data). The source application table has `307,511` rows and `122` columns. This project uses selected application-level fields rather than the other Home Credit tables.
+The set is intentionally selective rather than a generic aggregation grid. It includes explicit no-history flags. `CODE_GENDER`, opaque `EXT_SOURCE` scores, raw `AMT_GOODS_PRICE`, relationship IDs, post-application lifecycle fields, and sentinel dates are excluded. Age and family status remain candidate predictors and receive subgroup checks; several retained fields can act as socioeconomic proxies, so this public-data exercise makes no fairness or legal-compliance claim.
 
-Home Credit defines `TARGET = 1` as an applicant with payment difficulties: late payment of more than X days on at least one of the first Y instalments of the sample loan. `TARGET = 0` means that outcome was not observed under the dataset definition. The project title uses “default” as shorthand; `TARGET` is not a general legal or lender-specific definition of default.
+## Models and validation
 
-The selected fields cover application ID, target, income, credit and annuity amounts, contract type, asset ownership, age, employment, education, family status, housing, and occupation. Four features are engineered:
+Applicants are split once into 80% development and 20% final test with stratification and `random_state=42`. Model design uses five-fold stratified CV inside development only.
 
-- `AGE_YEARS = -DAYS_BIRTH / 365.25`
-- `YEARS_EMPLOYED = -DAYS_EMPLOYED / 365.25`
-- `CREDIT_INCOME_RATIO = AMT_CREDIT / AMT_INCOME_TOTAL`
-- `ANNUITY_INCOME_RATIO = AMT_ANNUITY / AMT_INCOME_TOTAL`
+- Logistic Regression: L2 penalty and a four-value `C` grid (`0.01`, `0.1`, `1`, `10`). Numeric clipping, imputation, scaling, rare-category pooling, and encoding are refit within each fold.
+- LightGBM: four restrained candidates and early stopping. No Optuna, SHAP, or additional challenger families are used.
+- Calibration: a cross-fitted sigmoid check uses development OOF scores. It was not retained because it did not improve Brier score by the prespecified `0.0001` minimum for either model.
+- Operations: risk deciles and fixed top-5%, top-10%, and top-20% review capacities are assigned by model score only, with deterministic tie handling.
 
-Positive `DAYS_EMPLOYED` placeholder values are treated as missing before employment years are calculated. `SK_ID_CURR` is used for data checks but not as a predictor. `CODE_GENDER` was inspected during data checks but excluded from the model. I kept the model focused on a limited set of applicant and loan characteristics.
+The application-only Logistic comparator is supporting evidence for the value of relational history, not a third production candidate.
 
-Raw CSV files are not committed to Git. Their expected location is described in [data/raw/README.md](data/raw/README.md).
+## Results
 
-## Analysis workflow
+Development CV means (standard deviation in parentheses):
 
-1. Load the selected fields and check application IDs, duplicate rows, missing targets, and target values.
-2. Handle the `DAYS_EMPLOYED` placeholder and create the four derived features.
-3. Make a stratified `80/20` train/holdout split with `random_state=42`.
-4. Calculate `0.1%` and `99.9%` clipping bounds from the training set and apply the same bounds to both splits.
-5. Fit median imputation and standardization for numeric features, plus `Unknown` imputation and one-hot encoding for categorical features, on the training data.
-6. Fit Logistic Regression with L2 regularization, `C=1.0`, `solver="liblinear"`, and no class weighting.
-7. Evaluate the holdout scores, compare thresholds, and create Low, Medium, and High Risk segments.
+| Model | ROC-AUC | PR-AUC | KS | Brier | Top-10% capture |
+|---|---:|---:|---:|---:|---:|
+| Application-only Logistic | 0.6576 (0.0051) | 0.1449 (0.0027) | 0.2349 (0.0074) | 0.07229 (0.00012) | 22.18% (0.30 pp) |
+| Full Logistic | 0.7225 (0.0044) | 0.2002 (0.0030) | 0.3287 (0.0073) | 0.06988 (0.00016) | 29.03% (0.53 pp) |
+| LightGBM | 0.7511 (0.0031) | 0.2323 (0.0030) | 0.3737 (0.0067) | 0.06836 (0.00016) | 32.10% (0.34 pp) |
 
-Imputation, scaling, encoding, and clipping do not use the holdout distribution.
+Locked final-test results on 61,503 applicants:
 
-## Model results and threshold trade-off
+| Model | ROC-AUC | Gini | PR-AUC | KS | Brier |
+|---|---:|---:|---:|---:|---:|
+| Logistic | 0.7248 | 0.4496 | 0.2025 | 0.3392 | 0.06976 |
+| LightGBM | 0.7553 | 0.5106 | 0.2377 | 0.3807 | 0.06805 |
 
-ROC-AUC measures ranking across all thresholds. Precision, recall, and F1 depend on the selected cutoff. At `0.15`, the model flags about `6.8%` of the holdout set; precision is about `18.6%`, recall about `15.8%`, and F1 about `17.1%`. The flag is targeted, but its coverage is low because it misses most observed payment-difficulty cases.
+Historical features add 0.0648 CV AUC to the Logistic benchmark relative to application-only inputs. LightGBM adds a further 0.0286 CV AUC and is the selected primary ranking model. Logistic remains the transparency-first alternative: its standardized coefficients are reported with five-fold sign stability, while the challenger uses gain importance.
 
-![Threshold trade-off curve](outputs/figures/threshold_tradeoff_curve.png)
+## Review capacity
 
-![ROC curve](outputs/figures/roc_curve.png)
+For the selected LightGBM model:
 
-Supporting files: [model metrics](outputs/model_metrics.csv), [threshold comparison](outputs/threshold_comparison.csv), and [Logistic Regression coefficients](outputs/logistic_regression_coefficients.csv).
+| Review capacity | Applicants reviewed | Events captured | Capture | Observed event rate | Lift |
+|---|---:|---:|---:|---:|---:|
+| 5% | 3,076 | 1,017 | 20.48% | 33.06% | 4.10× |
+| 10% | 6,151 | 1,676 | 33.76% | 27.25% | 3.38× |
+| 20% | 12,301 | 2,593 | 52.23% | 21.08% | 2.61× |
 
-## Risk segmentation
+These are prespecified workload scenarios, not optimized lending cutoffs. No costs or approval economics are assumed.
 
-Holdout scores are divided into three illustrative groups:
+![ROC and precision-recall comparison](outputs/figures/roc_pr_model_comparison.png)
 
-| Segment | Rule | Applicants | Observed payment-difficulty rate | Lift vs holdout baseline |
-| --- | --- | ---: | ---: | ---: |
-| Low Risk | score < 0.05 | 14,679 | 3.9% | 0.5× |
-| Medium Risk | 0.05 ≤ score < 0.15 | 42,615 | 8.5% | 1.0× |
-| High Risk | score ≥ 0.15 | 4,209 | 18.6% | 2.3× |
-
-![Observed payment-difficulty rate by risk segment](outputs/figures/payment_difficulty_rate_by_risk_segment.png)
-
-The High Risk segment has a clearly higher observed rate than the holdout baseline, but it contains only a small share of applicants and captures `15.8%` of the observed payment-difficulty cases. The segments describe score ranges; they are not credit decision rules.
-
-[View the risk segment summary](outputs/risk_segment_summary.csv).
+![Bad rate by risk decile](outputs/figures/bad_rate_by_decile.png)
 
 ## Limitations
 
-- The dataset is public competition data rather than a current lender sample.
-- The model uses selected fields from the application table only; it does not include bureau, repayment, or cash-flow history.
-- Ranking performance is modest (`ROC-AUC = 0.652`).
-- Evaluation uses one random holdout split, with no independent or out-of-time test.
-- Scores are not calibrated, and the `0.15` threshold has not been optimized with lending costs or review capacity.
+- The final test is a random holdout, not an out-of-time or external validation sample.
+- The public competition outcome and source population do not establish production lending suitability.
+- Age, family status, education, occupation, housing, and asset variables may encode sensitive or socioeconomic effects; subgroup diagnostics do not prove fairness.
+- LightGBM importance and penalized Logistic coefficients are associative, not causal.
+- Review-capacity results omit decision costs, policy constraints, reject inference, and portfolio drift.
 
-## What I would try next
-
-- Add cross-validation and reserve a separate final test set.
-- Check calibration with a calibration curve and Brier score.
-- Compare thresholds using explicit false-positive and false-negative costs.
-- Test one simple tree-based challenger against the Logistic Regression baseline.
-
-## Project structure
+## Repository structure
 
 ```text
-credit-risk-default-prediction-python/
-├── data/
-│   └── raw/
-│       └── README.md
-├── docs/
-│   └── project_notes.md
-├── notebooks/
-│   └── 01_credit_risk_default_prediction.ipynb
-├── outputs/
-│   ├── figures/
-│   ├── logistic_regression_coefficients.csv
-│   ├── model_metrics.csv
-│   ├── risk_segment_summary.csv
-│   └── threshold_comparison.csv
-├── .gitignore
-├── README.md
-└── requirements.txt
+data/raw/                   local source CSVs and data instructions
+data/processed/             local, ignored feature and split artifacts
+notebooks/01_data_audit.ipynb
+notebooks/02_feature_engineering.ipynb
+notebooks/03_model_development.ipynb
+notebooks/04_model_validation.ipynb
+src/data.py                 schemas and temporal filters
+src/features.py             five-family borrower aggregation
+src/modeling.py             fold-safe CV and locked fitting
+src/validation.py           risk metrics, deciles, capacity, figures
+tests/                      data-contract and validation tests
+outputs/tables/             generated validation tables
+outputs/figures/            generated figures
 ```
 
-## How to run
+## Reproduction
 
-1. Download the Home Credit competition data.
-2. Place `application_train.csv` in `data/raw/`. The optional field description file can go in the same folder.
-3. Install the dependencies and open the notebook from the project root:
+Use the repository root as the working directory.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-jupyter notebook notebooks/01_credit_risk_default_prediction.ipynb
+pytest -q
+python -m jupyter nbconvert --execute --to notebook --inplace notebooks/01_data_audit.ipynb
+python -m jupyter nbconvert --execute --to notebook --inplace notebooks/02_feature_engineering.ipynb
+python -m jupyter nbconvert --execute --to notebook --inplace notebooks/03_model_development.ipynb
+python -m jupyter nbconvert --execute --to notebook --inplace notebooks/04_model_validation.ipynb
 ```
 
-To execute it non-interactively:
+Place the six files listed in [`data/raw/README.md`](data/raw/README.md) before running. On macOS, LightGBM may also require `brew install libomp`. The processed borrower table, split IDs, fitted artifacts, and raw CSVs remain gitignored; all committed tables and figures are regenerated by the notebooks.
 
-```bash
-python -m jupyter nbconvert --execute --to notebook --inplace notebooks/01_credit_risk_default_prediction.ipynb
-```
-
-Running the notebook writes the documented CSV and figure outputs under `outputs/`.
+Source tables: [`dataset_summary.csv`](outputs/tables/dataset_summary.csv), [`feature_family_summary.csv`](outputs/tables/feature_family_summary.csv), [`cv_model_comparison.csv`](outputs/tables/cv_model_comparison.csv), [`final_test_model_metrics.csv`](outputs/tables/final_test_model_metrics.csv), [`risk_decile_summary.csv`](outputs/tables/risk_decile_summary.csv), and [`capacity_analysis.csv`](outputs/tables/capacity_analysis.csv).
