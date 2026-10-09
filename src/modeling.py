@@ -1,14 +1,15 @@
-"""Fold-safe development selection and locked final fitting for two models."""
+"""Nested outer-CV development and descriptive legacy-holdout fitting."""
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from scipy.special import expit, logit
+from scipy.special import expit
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -18,12 +19,26 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from .validation import capacity_table, coefficient_stability, ks_statistic
+from .validation import calibration_slope_intercept, capacity_table, ks_statistic
 
 
 RANDOM_STATE = 42
 C_GRID = (0.01, 0.1, 1.0, 10.0)
-CAPACITIES = (0.05, 0.10, 0.20)
+OUTER_FOLDS = 5
+INNER_FOLDS = 3
+LGBM_MAX_ESTIMATORS = 1200
+LGBM_EARLY_STOPPING_ROUNDS = 50
+
+REFERENCE_CATEGORIES = {
+    "APP_CONTRACT_TYPE": "Cash loans",
+    "APP_OWNS_CAR": "N",
+    "APP_OWNS_REALTY": "Y",
+    "APP_INCOME_TYPE": "Working",
+    "APP_EDUCATION_TYPE": "Secondary / secondary special",
+    "APP_FAMILY_STATUS": "Married",
+    "APP_HOUSING_TYPE": "House / apartment",
+    "APP_OCCUPATION_TYPE": "Laborers",
+}
 
 LIGHTGBM_CANDIDATES = (
     {"num_leaves": 15, "max_depth": 5, "min_child_samples": 100, "learning_rate": 0.04,
@@ -38,7 +53,7 @@ LIGHTGBM_CANDIDATES = (
 
 
 class QuantileClipper(BaseEstimator, TransformerMixin):
-    """Winsorize numeric columns using training-fold quantiles only."""
+    """Winsorize numeric columns using training-partition quantiles only."""
 
     def __init__(self, lower=0.005, upper=0.995):
         self.lower = lower
@@ -48,6 +63,11 @@ class QuantileClipper(BaseEstimator, TransformerMixin):
         array = np.asarray(X, dtype=float)
         self.lower_bounds_ = np.nanquantile(array, self.lower, axis=0)
         self.upper_bounds_ = np.nanquantile(array, self.upper, axis=0)
+        raw_min = np.nanmin(array, axis=0)
+        raw_max = np.nanmax(array, axis=0)
+        collapsed = (self.upper_bounds_ <= self.lower_bounds_) & (raw_max > raw_min)
+        self.lower_bounds_[collapsed] = raw_min[collapsed]
+        self.upper_bounds_[collapsed] = raw_max[collapsed]
         return self
 
     def transform(self, X):
@@ -60,7 +80,7 @@ class QuantileClipper(BaseEstimator, TransformerMixin):
 
 
 class RareCategoryGrouper(BaseEstimator, TransformerMixin):
-    """Pool categories with support below a training-fold threshold."""
+    """Pool categories with support below a training-partition threshold."""
 
     def __init__(self, min_count=200):
         self.min_count = min_count
@@ -87,45 +107,71 @@ class DevelopmentResult:
     split_ids: Dict[str, np.ndarray]
     selected_c: float
     selected_lgbm_params: dict
+    selected_lgbm_candidate: int
     selected_lgbm_iterations: int
+    outer_selections: pd.DataFrame
+    selection_audit: pd.DataFrame
     calibration: Dict[str, dict]
     oof_predictions: Dict[str, np.ndarray]
-    cv_summary: pd.DataFrame
+    outer_fold_metrics: pd.DataFrame
+    outer_cv_summary: pd.DataFrame
     logistic_stability: pd.DataFrame
+    primary_model: str
 
 
-def stratified_development_split(ids, target, test_size=0.20, random_state=RANDOM_STATE):
-    dev_ids, test_ids = train_test_split(
+def stratified_legacy_split(ids, target, test_size=0.20, random_state=RANDOM_STATE):
+    development_ids, legacy_ids = train_test_split(
         np.asarray(ids), test_size=test_size, stratify=np.asarray(target), random_state=random_state
     )
-    return {"development": np.sort(dev_ids), "final_test": np.sort(test_ids)}
+    return {"development": np.sort(development_ids), "legacy_holdout": np.sort(legacy_ids)}
+
+
+stratified_development_split = stratified_legacy_split
 
 
 def predictor_columns(frame: pd.DataFrame, application_only=False) -> List[str]:
-    cols = [c for c in frame.columns if c not in {"SK_ID_CURR", "TARGET"}]
-    if application_only:
-        cols = [c for c in cols if c.startswith("APP_")]
-    return cols
+    columns = [c for c in frame.columns if c not in {"SK_ID_CURR", "TARGET"}]
+    return [c for c in columns if c.startswith("APP_")] if application_only else columns
 
 
 def column_types(frame: pd.DataFrame, columns: Sequence[str]) -> Tuple[List[str], List[str]]:
     categorical = [c for c in columns if frame[c].dtype == "object" or str(frame[c].dtype).startswith("category")]
-    numeric = [c for c in columns if c not in categorical]
-    return numeric, categorical
+    return [c for c in columns if c not in categorical], categorical
+
+
+def _category_levels(frame: pd.DataFrame, categorical: Sequence[str], min_count=200):
+    levels = []
+    for column in categorical:
+        values = frame[column].fillna("__MISSING__").astype(str)
+        frequent = set(values.value_counts()[lambda counts: counts >= min_count].index)
+        reference = REFERENCE_CATEGORIES.get(column)
+        ordered = [reference] if reference is not None else []
+        ordered.extend(sorted(frequent - set(ordered)))
+        # Missing is already present when frequent and otherwise maps to rare.
+        # Rare is always reserved so validation-only categories remain known.
+        if "__RARE__" not in ordered:
+            ordered.append("__RARE__")
+        levels.append(np.asarray(ordered, dtype=object))
+    return levels
 
 
 def make_preprocessor(frame: pd.DataFrame, columns: Sequence[str], model_kind: str) -> ColumnTransformer:
     numeric, categorical = column_types(frame, columns)
     numeric_steps = [
         ("clip", QuantileClipper()),
-        ("impute", SimpleImputer(strategy="median", add_indicator=True)),
+        ("impute", SimpleImputer(strategy="median", add_indicator=False)),
     ]
+    categories = _category_levels(frame, categorical)
     if model_kind == "logistic":
         numeric_steps.append(("scale", StandardScaler()))
-        cat_encoder = OneHotEncoder(handle_unknown="ignore", drop="first", sparse_output=True)
+        cat_encoder = OneHotEncoder(
+            categories=categories,
+            handle_unknown="ignore",
+            drop=[REFERENCE_CATEGORIES[column] for column in categorical],
+            sparse_output=True,
+        )
     else:
-        # Nominal labels must not acquire an arbitrary numeric order in tree splits.
-        cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        cat_encoder = OneHotEncoder(categories=categories, handle_unknown="ignore", sparse_output=False)
     categorical_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="constant", fill_value="__MISSING__")),
         ("rare", RareCategoryGrouper(min_count=200)),
@@ -139,257 +185,331 @@ def make_preprocessor(frame: pd.DataFrame, columns: Sequence[str], model_kind: s
     )
 
 
-def _fold_metric_rows(y, score, model, candidate, fold) -> List[dict]:
-    auc = roc_auc_score(y, score)
-    rows = [{
-        "model": model,
-        "candidate": candidate,
-        "fold": fold,
-        "metric": "roc_auc",
-        "value": auc,
-    }, {
-        "model": model,
-        "candidate": candidate,
-        "fold": fold,
-        "metric": "gini",
-        "value": 2 * auc - 1,
-    }, {
-        "model": model,
-        "candidate": candidate,
-        "fold": fold,
-        "metric": "average_precision",
-        "value": average_precision_score(y, score),
-    }, {
-        "model": model,
-        "candidate": candidate,
-        "fold": fold,
-        "metric": "ks",
-        "value": ks_statistic(y, score),
-    }, {
-        "model": model,
-        "candidate": candidate,
-        "fold": fold,
-        "metric": "brier",
-        "value": brier_score_loss(y, score),
-    }]
-    cap = capacity_table(y, score, model)
-    for row in cap.itertuples(index=False):
-        rows.append({
-            "model": model,
-            "candidate": candidate,
-            "fold": fold,
-            "metric": f"capture_at_{int(row.capacity_share * 100)}pct",
-            "value": row.bad_capture_share,
-        })
-    return rows
-
-
-def _summary(metric_rows: list) -> pd.DataFrame:
-    detail = pd.DataFrame(metric_rows)
-    return detail.groupby(["model", "candidate", "metric"], observed=True)["value"].agg(
-        mean="mean", std="std", min="min", max="max", folds="count"
-    ).reset_index()
-
-
-def cross_validate_logistic(
-    frame: pd.DataFrame,
-    columns: Sequence[str],
-    folds: StratifiedKFold,
-    c_grid=C_GRID,
-    model_name="Logistic",
-):
-    y = frame["TARGET"].to_numpy()
-    predictions = {c: np.zeros(len(frame)) for c in c_grid}
-    metric_rows = []
-    coefficients = {c: [] for c in c_grid}
-    for fold, (train_idx, valid_idx) in enumerate(folds.split(frame, y), 1):
-        train = frame.iloc[train_idx]
-        valid = frame.iloc[valid_idx]
-        preprocessor = make_preprocessor(train, columns, "logistic")
-        x_train = preprocessor.fit_transform(train[list(columns)])
-        x_valid = preprocessor.transform(valid[list(columns)])
-        names = preprocessor.get_feature_names_out()
-        for c in c_grid:
-            model = LogisticRegression(C=c, penalty="l2", solver="liblinear", max_iter=1000)
-            model.fit(x_train, train["TARGET"])
-            score = model.predict_proba(x_valid)[:, 1]
-            predictions[c][valid_idx] = score
-            metric_rows.extend(_fold_metric_rows(valid["TARGET"], score, model_name, f"C={c:g}", fold))
-            coefficients[c].append(pd.DataFrame({
-                "feature": names,
-                "coefficient": model.coef_[0],
-                "fold": fold,
-            }))
-    summary = _summary(metric_rows)
-    aucs = summary[summary["metric"].eq("roc_auc")].sort_values(
-        ["mean", "std"], ascending=[False, True]
-    )
-    chosen_label = aucs.iloc[0]["candidate"]
-    chosen_c = float(str(chosen_label).split("=")[1])
-    stability = coefficient_stability(coefficients[chosen_c])
-    stability["odds_ratio"] = np.exp(stability["coefficient_mean"])
-    stability["source_family"] = stability["feature"].str.extract(r"(?:numeric|categorical)__(APP|BUREAU|BB|PREV|INST)_", expand=False).fillna("Encoded")
-    return chosen_c, predictions[chosen_c], summary, stability
-
-
-def _lgbm_model(params: dict, random_state=RANDOM_STATE, n_estimators=800):
-    return lgb.LGBMClassifier(
-        objective="binary",
-        n_estimators=n_estimators,
-        random_state=random_state,
-        n_jobs=-1,
-        verbosity=-1,
-        subsample_freq=1,
-        **params,
-    )
-
-
-def cross_validate_lightgbm(frame, columns, folds, candidates=LIGHTGBM_CANDIDATES):
-    y = frame["TARGET"].to_numpy()
-    predictions = {i: np.zeros(len(frame)) for i in range(len(candidates))}
-    metric_rows, best_iterations = [], {i: [] for i in range(len(candidates))}
-    for fold, (train_idx, valid_idx) in enumerate(folds.split(frame, y), 1):
-        train = frame.iloc[train_idx]
-        valid = frame.iloc[valid_idx]
-        preprocessor = make_preprocessor(train, columns, "lightgbm")
-        x_train = preprocessor.fit_transform(train[list(columns)])
-        x_valid = preprocessor.transform(valid[list(columns)])
-        for idx, params in enumerate(candidates):
-            model = _lgbm_model(params)
-            model.fit(
-                x_train,
-                train["TARGET"],
-                eval_set=[(x_valid, valid["TARGET"])],
-                eval_metric="auc",
-                callbacks=[lgb.early_stopping(50, verbose=False)],
-            )
-            score = model.predict_proba(x_valid, num_iteration=model.best_iteration_)[:, 1]
-            predictions[idx][valid_idx] = score
-            best_iterations[idx].append(int(model.best_iteration_))
-            metric_rows.extend(_fold_metric_rows(valid["TARGET"], score, "LightGBM", f"candidate_{idx + 1}", fold))
-    summary = _summary(metric_rows)
-    aucs = summary[summary["metric"].eq("roc_auc")].sort_values(
-        ["mean", "std"], ascending=[False, True]
-    )
-    chosen_label = aucs.iloc[0]["candidate"]
-    chosen_idx = int(str(chosen_label).split("_")[1]) - 1
-    selected_iterations = int(np.median(best_iterations[chosen_idx]))
-    return chosen_idx, predictions[chosen_idx], selected_iterations, summary
-
-
-def cross_fit_sigmoid(y, raw_score, folds: StratifiedKFold, minimum_brier_gain=1e-4):
-    y = np.asarray(y)
-    raw = np.clip(np.asarray(raw_score), 1e-6, 1 - 1e-6)
-    calibrated = np.zeros(len(y))
-    x = logit(raw).reshape(-1, 1)
-    for train_idx, valid_idx in folds.split(x, y):
-        calibrator = LogisticRegression(C=1e6, solver="lbfgs")
-        calibrator.fit(x[train_idx], y[train_idx])
-        calibrated[valid_idx] = calibrator.predict_proba(x[valid_idx])[:, 1]
-    raw_brier = brier_score_loss(y, raw)
-    calibrated_brier = brier_score_loss(y, calibrated)
-    use_calibration = raw_brier - calibrated_brier > minimum_brier_gain
-    final_calibrator = LogisticRegression(C=1e6, solver="lbfgs").fit(x, y)
+def transformed_matrix_diagnostics(matrix) -> dict:
+    array = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+    variances = np.var(array, axis=0)
     return {
-        "use_calibration": bool(use_calibration),
-        "raw_brier": float(raw_brier),
-        "calibrated_brier": float(calibrated_brier),
-        "brier_gain": float(raw_brier - calibrated_brier),
-        "coefficient": float(final_calibrator.coef_[0, 0]),
-        "intercept": float(final_calibrator.intercept_[0]),
-        "cross_fitted_score": calibrated if use_calibration else raw,
+        "rows": int(array.shape[0]),
+        "columns": int(array.shape[1]),
+        "minimum": float(np.min(array)),
+        "maximum": float(np.max(array)),
+        "largest_absolute": float(np.max(np.abs(array))),
+        "non_finite": int((~np.isfinite(array)).sum()),
+        "zero_variance_columns": int(np.sum(variances == 0)),
     }
 
 
-def apply_sigmoid(score, calibration: dict):
-    p = np.clip(np.asarray(score), 1e-6, 1 - 1e-6)
-    if not calibration["use_calibration"]:
-        return p
-    return expit(calibration["intercept"] + calibration["coefficient"] * logit(p))
+def _metric_values(y, score) -> dict:
+    auc = roc_auc_score(y, score)
+    values = {
+        "roc_auc": float(auc),
+        "gini": float(2 * auc - 1),
+        "average_precision": float(average_precision_score(y, score)),
+        "ks": float(ks_statistic(y, score)),
+        "brier": float(brier_score_loss(y, score)),
+    }
+    for row in capacity_table(y, score, "model").itertuples(index=False):
+        values[f"capture_at_{int(row.capacity_share * 100)}pct"] = float(row.bad_capture_share)
+    return values
+
+
+def _metric_rows(y, score, model, fold) -> List[dict]:
+    return [
+        {"model": model, "outer_fold": fold, "metric": metric, "value": value}
+        for metric, value in _metric_values(y, score).items()
+    ]
+
+
+def _outer_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    grouped = detail.groupby(["model", "metric"], observed=True)["value"].agg(["mean", "std"])
+    rows = []
+    for model in detail["model"].drop_duplicates():
+        row = {"model": model}
+        for metric in detail["metric"].unique():
+            row[f"{metric}_mean"] = grouped.loc[(model, metric), "mean"]
+            row[f"{metric}_std"] = grouped.loc[(model, metric), "std"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _new_logistic(c):
+    return LogisticRegression(C=c, penalty="l2", solver="liblinear", max_iter=1000)
+
+
+def _logistic_score(model, matrix):
+    """Score without the platform BLAS matmul warnings seen in sklearn's path."""
+    if hasattr(matrix, "multiply"):
+        linear = np.asarray(matrix.multiply(model.coef_[0]).sum(axis=1)).ravel()
+    else:
+        linear = np.einsum("ij,j->i", np.asarray(matrix), model.coef_[0], optimize=False)
+    return expit(linear + model.intercept_[0])
+
+
+def _select_logistic_c(outer_train, columns, seed):
+    y = outer_train["TARGET"].to_numpy()
+    folds = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=seed)
+    aucs = {c: [] for c in C_GRID}
+    for inner_train_idx, inner_valid_idx in folds.split(outer_train, y):
+        inner_train = outer_train.iloc[inner_train_idx]
+        inner_valid = outer_train.iloc[inner_valid_idx]
+        preprocessor = make_preprocessor(inner_train, columns, "logistic")
+        x_train = preprocessor.fit_transform(inner_train[list(columns)])
+        x_valid = preprocessor.transform(inner_valid[list(columns)])
+        for c in C_GRID:
+            model = _new_logistic(c).fit(x_train, inner_train["TARGET"])
+            score = _logistic_score(model, x_valid)
+            aucs[c].append(roc_auc_score(inner_valid["TARGET"], score))
+    chosen = sorted(C_GRID, key=lambda c: (-np.mean(aucs[c]), c))[0]
+    return float(chosen), {str(c): float(np.mean(values)) for c, values in aucs.items()}
+
+
+def _lgbm_model(params: dict, random_state=RANDOM_STATE, n_estimators=LGBM_MAX_ESTIMATORS):
+    return lgb.LGBMClassifier(
+        objective="binary", n_estimators=n_estimators, random_state=random_state,
+        n_jobs=-1, verbosity=-1, subsample_freq=1, **params,
+    )
+
+
+def _select_lightgbm(outer_train, columns, seed):
+    indices = np.arange(len(outer_train))
+    inner_train_idx, inner_valid_idx = train_test_split(
+        indices, test_size=0.20, stratify=outer_train["TARGET"], random_state=seed
+    )
+    inner_train = outer_train.iloc[inner_train_idx]
+    inner_valid = outer_train.iloc[inner_valid_idx]
+    preprocessor = make_preprocessor(inner_train, columns, "lightgbm")
+    x_train = preprocessor.fit_transform(inner_train[list(columns)])
+    x_valid = preprocessor.transform(inner_valid[list(columns)])
+    candidates = []
+    for index, params in enumerate(LIGHTGBM_CANDIDATES):
+        model = _lgbm_model(params, random_state=seed)
+        model.fit(
+            x_train, inner_train["TARGET"],
+            eval_set=[(x_valid, inner_valid["TARGET"])], eval_metric="auc",
+            callbacks=[lgb.early_stopping(LGBM_EARLY_STOPPING_ROUNDS, verbose=False)],
+        )
+        score = model.booster_.predict(x_valid, num_iteration=model.best_iteration_)
+        candidates.append({
+            "candidate": index,
+            "inner_auc": float(roc_auc_score(inner_valid["TARGET"], score)),
+            "best_iteration": int(model.best_iteration_),
+        })
+    selected = sorted(candidates, key=lambda row: (-row["inner_auc"], row["candidate"]))[0]
+    return selected, inner_train_idx, inner_valid_idx, candidates
+
+
+def _feature_metadata(preprocessor) -> pd.DataFrame:
+    numeric = list(preprocessor.transformers_[0][2])
+    categorical = list(preprocessor.transformers_[1][2])
+    rows = [
+        {"transformed_feature": f"numeric__{feature}", "source_feature": feature,
+         "category": "", "reference_category": ""}
+        for feature in numeric
+    ]
+    encoder = preprocessor.named_transformers_["categorical"].named_steps["encode"]
+    encoded_names = list(encoder.get_feature_names_out(categorical))
+    position = 0
+    for index, feature in enumerate(categorical):
+        drop_index = None if encoder.drop_idx_ is None else encoder.drop_idx_[index]
+        for category_index, category in enumerate(encoder.categories_[index]):
+            if drop_index is not None and category_index == drop_index:
+                continue
+            rows.append({
+                "transformed_feature": f"categorical__{encoded_names[position]}",
+                "source_feature": feature,
+                "category": str(category),
+                "reference_category": REFERENCE_CATEGORIES[feature],
+            })
+            position += 1
+    return pd.DataFrame(rows)
+
+
+def _coefficient_stability(coefficient_frames):
+    combined = pd.concat(coefficient_frames, ignore_index=True)
+    keys = ["transformed_feature", "source_feature", "category", "reference_category"]
+    grouped = combined.groupby(keys, observed=True, dropna=False)["coefficient"]
+    out = grouped.agg(fold_mean="mean", fold_std="std", coefficient="mean", folds="count").reset_index()
+    signs = grouped.apply(lambda values: max((values >= 0).mean(), (values <= 0).mean())).rename("sign_stability")
+    out = out.merge(signs.reset_index(), on=keys)
+    out["odds_ratio"] = np.exp(out["coefficient"])
+    out["source_family"] = out["source_feature"].str.extract(r"^(APP|BUREAU|BB|PREV|INST)_", expand=False)
+    columns = keys + ["coefficient", "odds_ratio", "fold_mean", "fold_std", "sign_stability", "source_family", "folds"]
+    return out[columns].sort_values("coefficient", key=lambda values: values.abs(), ascending=False)
+
+
+def _stable_mode(values):
+    counts = Counter(values)
+    return sorted(counts, key=lambda value: (-counts[value], value))[0]
+
+
+def nested_split_plan(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return auditable global-index relationships for the nested split design."""
+    y = frame["TARGET"].to_numpy()
+    outer = StratifiedKFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    rows = []
+    for fold, (outer_train_idx, outer_valid_idx) in enumerate(outer.split(frame, y), 1):
+        inner = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE + fold)
+        for inner_fold, (relative_train, relative_valid) in enumerate(inner.split(outer_train_idx, y[outer_train_idx]), 1):
+            inner_train = outer_train_idx[relative_train]
+            inner_valid = outer_train_idx[relative_valid]
+            rows.append({
+                "outer_fold": fold,
+                "inner_fold": inner_fold,
+                "inner_train_outer_valid_overlap": len(np.intersect1d(inner_train, outer_valid_idx)),
+                "inner_valid_outer_valid_overlap": len(np.intersect1d(inner_valid, outer_valid_idx)),
+                "outer_train_rows": len(outer_train_idx),
+                "outer_valid_rows": len(outer_valid_idx),
+            })
+    return pd.DataFrame(rows)
 
 
 def run_development(frame: pd.DataFrame) -> DevelopmentResult:
-    split_ids = stratified_development_split(frame["SK_ID_CURR"], frame["TARGET"])
-    dev = frame[frame["SK_ID_CURR"].isin(split_ids["development"])].reset_index(drop=True)
-    folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    all_columns = predictor_columns(dev)
-    app_columns = predictor_columns(dev, application_only=True)
+    """Generate primary evidence with fully separated outer validation folds."""
+    split_ids = stratified_legacy_split(frame["SK_ID_CURR"], frame["TARGET"])
+    all_columns = predictor_columns(frame)
+    app_columns = predictor_columns(frame, application_only=True)
+    y = frame["TARGET"].to_numpy()
+    outer = StratifiedKFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    predictions = {name: np.zeros(len(frame)) for name in (
+        "Application-only Logistic", "Logistic", "LightGBM"
+    )}
+    metric_rows, selection_rows, audit_rows, coefficient_frames = [], [], [], []
 
-    app_c, app_oof, app_summary, _ = cross_validate_logistic(
-        dev, app_columns, folds, model_name="Application-only Logistic"
-    )
-    selected_c, logistic_oof, logistic_summary, stability = cross_validate_logistic(
-        dev, all_columns, folds, model_name="Logistic"
-    )
-    selected_lgbm, lgbm_oof, iterations, lgbm_summary = cross_validate_lightgbm(
-        dev, all_columns, folds
-    )
-    calibration = {
-        "Logistic": cross_fit_sigmoid(dev["TARGET"], logistic_oof, folds),
-        "LightGBM": cross_fit_sigmoid(dev["TARGET"], lgbm_oof, folds),
-    }
-    oof_predictions = {
-        "Application-only Logistic": app_oof,
-        "Logistic": calibration["Logistic"]["cross_fitted_score"],
-        "LightGBM": calibration["LightGBM"]["cross_fitted_score"],
-    }
-    cv_summary = pd.concat([app_summary, logistic_summary, lgbm_summary], ignore_index=True)
-    cv_summary["selected"] = (
-        ((cv_summary["model"] == "Application-only Logistic") & (cv_summary["candidate"] == f"C={app_c:g}"))
-        | ((cv_summary["model"] == "Logistic") & (cv_summary["candidate"] == f"C={selected_c:g}"))
-        | ((cv_summary["model"] == "LightGBM") & (cv_summary["candidate"] == f"candidate_{selected_lgbm + 1}"))
-    )
+    for fold, (outer_train_idx, outer_valid_idx) in enumerate(outer.split(frame, y), 1):
+        outer_train = frame.iloc[outer_train_idx].reset_index(drop=True)
+        outer_valid = frame.iloc[outer_valid_idx]
+        outer_valid_ids = set(outer_valid["SK_ID_CURR"])
+
+        for name, columns in (("Application-only Logistic", app_columns), ("Logistic", all_columns)):
+            selected_c, inner_scores = _select_logistic_c(outer_train, columns, RANDOM_STATE + fold)
+            preprocessor = make_preprocessor(outer_train, columns, "logistic")
+            x_train = preprocessor.fit_transform(outer_train[list(columns)])
+            x_valid = preprocessor.transform(outer_valid[list(columns)])
+            model = _new_logistic(selected_c).fit(x_train, outer_train["TARGET"])
+            score = _logistic_score(model, x_valid)
+            predictions[name][outer_valid_idx] = score
+            metric_rows.extend(_metric_rows(outer_valid["TARGET"], score, name, fold))
+            selection_rows.append({
+                "outer_fold": fold, "model": name, "selected_c": selected_c,
+                "selected_lgbm_candidate": np.nan, "selected_lgbm_iterations": np.nan,
+                "inner_selection_score": inner_scores[str(selected_c)],
+            })
+            if name == "Logistic":
+                metadata = _feature_metadata(preprocessor)
+                metadata["coefficient"] = model.coef_[0]
+                metadata["outer_fold"] = fold
+                coefficient_frames.append(metadata)
+
+        selected, inner_train_idx, inner_valid_idx, candidate_results = _select_lightgbm(
+            outer_train, all_columns, RANDOM_STATE + 100 + fold
+        )
+        preprocessor = make_preprocessor(outer_train, all_columns, "lightgbm")
+        x_train = preprocessor.fit_transform(outer_train[all_columns])
+        x_valid = preprocessor.transform(outer_valid[all_columns])
+        challenger = _lgbm_model(
+            LIGHTGBM_CANDIDATES[selected["candidate"]],
+            random_state=RANDOM_STATE + fold,
+            n_estimators=selected["best_iteration"],
+        ).fit(x_train, outer_train["TARGET"])
+        score = challenger.booster_.predict(x_valid)
+        predictions["LightGBM"][outer_valid_idx] = score
+        metric_rows.extend(_metric_rows(outer_valid["TARGET"], score, "LightGBM", fold))
+        selection_rows.append({
+            "outer_fold": fold, "model": "LightGBM", "selected_c": np.nan,
+            "selected_lgbm_candidate": selected["candidate"] + 1,
+            "selected_lgbm_iterations": selected["best_iteration"],
+            "inner_selection_score": selected["inner_auc"],
+        })
+        inner_train_ids = set(outer_train.iloc[inner_train_idx]["SK_ID_CURR"])
+        inner_valid_ids = set(outer_train.iloc[inner_valid_idx]["SK_ID_CURR"])
+        audit_rows.append({
+            "outer_fold": fold,
+            "outer_train_rows": len(outer_train_idx),
+            "outer_valid_rows": len(outer_valid_idx),
+            "lgbm_inner_train_rows": len(inner_train_idx),
+            "lgbm_inner_valid_rows": len(inner_valid_idx),
+            "inner_train_outer_valid_overlap": len(inner_train_ids & outer_valid_ids),
+            "inner_valid_outer_valid_overlap": len(inner_valid_ids & outer_valid_ids),
+            "outer_validation_used_for_early_stopping": False,
+            "candidate_results": candidate_results,
+        })
+
+    detail = pd.DataFrame(metric_rows)
+    summary = _outer_summary(detail)
+    selections = pd.DataFrame(selection_rows)
+    selected_c = float(_stable_mode(selections.loc[selections["model"].eq("Logistic"), "selected_c"]))
+    selected_candidate = int(_stable_mode(
+        selections.loc[selections["model"].eq("LightGBM"), "selected_lgbm_candidate"].astype(int)
+    ))
+    matching_iterations = selections.loc[
+        selections["model"].eq("LightGBM") & selections["selected_lgbm_candidate"].eq(selected_candidate),
+        "selected_lgbm_iterations",
+    ]
+    selected_iterations = int(np.median(matching_iterations))
+    calibration = {}
+    for model, score in predictions.items():
+        slope, intercept = calibration_slope_intercept(y, score)
+        calibration[model] = {
+            "applied": False, "raw_brier": float(brier_score_loss(y, score)),
+            "slope": slope, "intercept": intercept,
+        }
+    log_auc = float(summary.loc[summary["model"].eq("Logistic"), "roc_auc_mean"].iloc[0])
+    lgb_auc = float(summary.loc[summary["model"].eq("LightGBM"), "roc_auc_mean"].iloc[0])
+    primary = "LightGBM" if lgb_auc - log_auc >= 0.005 else "Logistic"
     return DevelopmentResult(
         split_ids=split_ids,
         selected_c=selected_c,
-        selected_lgbm_params=dict(LIGHTGBM_CANDIDATES[selected_lgbm]),
-        selected_lgbm_iterations=iterations,
+        selected_lgbm_params=dict(LIGHTGBM_CANDIDATES[selected_candidate - 1]),
+        selected_lgbm_candidate=selected_candidate,
+        selected_lgbm_iterations=selected_iterations,
+        outer_selections=selections,
+        selection_audit=pd.DataFrame(audit_rows),
         calibration=calibration,
-        oof_predictions=oof_predictions,
-        cv_summary=cv_summary,
-        logistic_stability=stability,
+        oof_predictions=predictions,
+        outer_fold_metrics=detail,
+        outer_cv_summary=summary,
+        logistic_stability=_coefficient_stability(coefficient_frames),
+        primary_model=primary,
     )
 
 
-def fit_locked_models(frame: pd.DataFrame, result: DevelopmentResult):
-    dev = frame[frame["SK_ID_CURR"].isin(result.split_ids["development"])].reset_index(drop=True)
-    final = frame[frame["SK_ID_CURR"].isin(result.split_ids["final_test"])].reset_index(drop=True)
-    columns = predictor_columns(dev)
+def fit_legacy_holdout_models(frame: pd.DataFrame, result: DevelopmentResult):
+    """Fit outer-evidence specifications and score the historical split once."""
+    development = frame[frame["SK_ID_CURR"].isin(result.split_ids["development"])].reset_index(drop=True)
+    legacy = frame[frame["SK_ID_CURR"].isin(result.split_ids["legacy_holdout"])].reset_index(drop=True)
+    columns = predictor_columns(development)
 
-    logistic_pre = make_preprocessor(dev, columns, "logistic")
-    x_dev_log = logistic_pre.fit_transform(dev[columns])
-    x_final_log = logistic_pre.transform(final[columns])
-    logistic = LogisticRegression(C=result.selected_c, penalty="l2", solver="liblinear", max_iter=1000)
-    logistic.fit(x_dev_log, dev["TARGET"])
-    logistic_raw = logistic.predict_proba(x_final_log)[:, 1]
+    logistic_pre = make_preprocessor(development, columns, "logistic")
+    x_development = logistic_pre.fit_transform(development[columns])
+    x_legacy = logistic_pre.transform(legacy[columns])
+    logistic = _new_logistic(result.selected_c).fit(x_development, development["TARGET"])
+    logistic_score = _logistic_score(logistic, x_legacy)
 
-    lgbm_pre = make_preprocessor(dev, columns, "lightgbm")
-    x_dev_lgbm = lgbm_pre.fit_transform(dev[columns])
-    x_final_lgbm = lgbm_pre.transform(final[columns])
-    challenger = _lgbm_model(result.selected_lgbm_params, n_estimators=result.selected_lgbm_iterations)
-    challenger.fit(x_dev_lgbm, dev["TARGET"])
-    lgbm_raw = challenger.predict_proba(x_final_lgbm)[:, 1]
+    lgbm_pre = make_preprocessor(development, columns, "lightgbm")
+    x_development_lgbm = lgbm_pre.fit_transform(development[columns])
+    x_legacy_lgbm = lgbm_pre.transform(legacy[columns])
+    challenger = _lgbm_model(
+        result.selected_lgbm_params, n_estimators=result.selected_lgbm_iterations
+    ).fit(x_development_lgbm, development["TARGET"])
+    lgbm_score = challenger.booster_.predict(x_legacy_lgbm)
 
-    predictions = {
-        "Logistic": apply_sigmoid(logistic_raw, result.calibration["Logistic"]),
-        "LightGBM": apply_sigmoid(lgbm_raw, result.calibration["LightGBM"]),
-    }
     importance = pd.DataFrame({
         "feature": lgbm_pre.get_feature_names_out(),
         "gain_importance": challenger.booster_.feature_importance(importance_type="gain"),
         "split_importance": challenger.booster_.feature_importance(importance_type="split"),
     }).sort_values("gain_importance", ascending=False)
-    final_coefficients = pd.DataFrame({
-        "feature": logistic_pre.get_feature_names_out(),
-        "coefficient": logistic.coef_[0],
-    })
-    final_coefficients["odds_ratio"] = np.exp(final_coefficients["coefficient"])
+    coefficients = _feature_metadata(logistic_pre)
+    coefficients["coefficient"] = logistic.coef_[0]
+    coefficients["odds_ratio"] = np.exp(coefficients["coefficient"])
     return {
-        "development": dev,
-        "final_test": final,
-        "predictions": predictions,
+        "development": development,
+        "legacy_holdout": legacy,
+        "predictions": {"Logistic": logistic_score, "LightGBM": lgbm_score},
         "models": {"Logistic": logistic, "LightGBM": challenger},
         "preprocessors": {"Logistic": logistic_pre, "LightGBM": lgbm_pre},
-        "logistic_coefficients": final_coefficients,
+        "logistic_coefficients": coefficients,
         "lightgbm_importance": importance,
     }
+
+
+fit_locked_models = fit_legacy_holdout_models

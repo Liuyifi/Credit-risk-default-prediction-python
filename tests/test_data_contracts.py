@@ -9,7 +9,13 @@ from src.data import (
     temporal_filter_installments,
     validate_raw_files,
 )
-from src.features import validate_feature_table
+from src.features import (
+    bureau_balance_status_columns,
+    consolidate_installment_rows,
+    safe_ratio,
+    validate_feature_table,
+)
+from src.modeling import REFERENCE_CATEGORIES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,10 +56,41 @@ def test_temporal_filters_and_borrower_contract():
     assert audit["excluded_rows"] == 2
 
     columns = {"SK_ID_CURR": [1, 2], "TARGET": [0, 1]}
-    for idx in range(60):
+    for idx in range(95):
         columns[f"APP_TEST_{idx}"] = [idx, idx + 1]
     table = pd.DataFrame(columns)
     validate_feature_table(table, expected_rows=2)
+
+
+def test_bureau_balance_numeric_status_denominator_semantics():
+    months = pd.DataFrame({"STATUS": ["0", "1", "2", "C", "X"]})
+    flagged = bureau_balance_status_columns(months)
+    assert flagged["BB_STATUS_OBSERVED"].sum() == 3
+    assert flagged["BB_DELINQUENT"].sum() == 2
+    assert flagged["BB_31_PLUS"].sum() == 1
+    delinquent_share = safe_ratio(
+        pd.Series([flagged["BB_DELINQUENT"].sum()]),
+        pd.Series([flagged["BB_STATUS_OBSERVED"].sum()]),
+    ).iloc[0]
+    assert np.isclose(delinquent_share, 2 / 3)
+
+
+def test_partial_installments_use_last_payment_day_and_summed_amount():
+    raw = pd.DataFrame({
+        "SK_ID_CURR": [1, 1],
+        "SK_ID_PREV": [10, 10],
+        "NUM_INSTALMENT_VERSION": [1, 1],
+        "NUM_INSTALMENT_NUMBER": [2, 2],
+        "DAYS_INSTALMENT": [-20, -20],
+        "DAYS_ENTRY_PAYMENT": [-22, -15],
+        "AMT_INSTALMENT": [100.0, 100.0],
+        "AMT_PAYMENT": [40.0, 60.0],
+    })
+    consolidated = consolidate_installment_rows(raw).iloc[0]
+    assert consolidated["SCHEDULED_DAY"] == -20
+    assert consolidated["PAYMENT_DAY"] == -15
+    assert consolidated["SCHEDULED_AMOUNT"] == 100.0
+    assert consolidated["PAYMENT_AMOUNT"] == 100.0
 
 
 def test_cached_feature_table_contract_when_available():
@@ -62,3 +99,5 @@ def test_cached_feature_table_contract_when_available():
         return
     frame = pd.read_pickle(cache)
     validate_feature_table(frame, expected_rows=307_511)
+    for feature, reference in REFERENCE_CATEGORIES.items():
+        assert frame[feature].fillna("__MISSING__").astype(str).eq(reference).sum() >= 200

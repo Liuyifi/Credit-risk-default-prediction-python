@@ -22,12 +22,47 @@ from .data import (
 
 ID_COL = "SK_ID_CURR"
 TARGET_COL = "TARGET"
-MAX_FEATURES = 150
+MAX_FEATURES = 120
+INSTALLMENT_KEYS = [ID_COL, "SK_ID_PREV", "NUM_INSTALMENT_VERSION", "NUM_INSTALMENT_NUMBER"]
 
 
 def safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     denominator = denominator.replace(0, np.nan)
     return numerator.div(denominator).replace([np.inf, -np.inf], np.nan)
+
+
+def bureau_balance_status_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Create explicit all-month and numeric-status indicators.
+
+    ``STATUS`` values 0--5 are observed delinquency states. ``C`` and ``X`` are
+    valid monthly records but are not numeric delinquency observations, so they
+    stay in ``BB_MONTH_COUNT`` and are excluded from status-share denominators.
+    """
+    out = frame.copy()
+    severity = pd.to_numeric(out["STATUS"], errors="coerce")
+    out["BB_STATUS_OBSERVED"] = severity.between(0, 5).astype("int8")
+    out["BB_DELINQUENT"] = severity.between(1, 5).astype("int8")
+    out["BB_31_PLUS"] = severity.between(2, 5).astype("int8")
+    out["BB_61_PLUS"] = severity.between(3, 5).astype("int8")
+    out["BB_91_PLUS"] = severity.between(4, 5).astype("int8")
+    out["BB_CLEAN"] = severity.eq(0).astype("int8")
+    out["BB_SEVERITY"] = severity.fillna(0)
+    return out
+
+
+def consolidate_installment_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Consolidate partial payments to one scheduled-installment record.
+
+    The last actual payment day is intentional: settlement is late if the final
+    partial payment needed to satisfy the installment arrives after schedule.
+    Payment amounts are summed; scheduled amount is repeated on raw payment rows.
+    """
+    return frame.groupby(INSTALLMENT_KEYS, observed=True, dropna=False).agg(
+        SCHEDULED_DAY=("DAYS_INSTALMENT", "min"),
+        PAYMENT_DAY=("DAYS_ENTRY_PAYMENT", "max"),
+        SCHEDULED_AMOUNT=("AMT_INSTALMENT", "max"),
+        PAYMENT_AMOUNT=("AMT_PAYMENT", "sum"),
+    ).reset_index()
 
 
 def application_features(application: pd.DataFrame) -> pd.DataFrame:
@@ -118,19 +153,14 @@ def bureau_balance_features(
         unmapped_rows += int((~mapped).sum())
         chunk = chunk.loc[mapped].copy()
         retained_rows += len(chunk)
-        severity = pd.to_numeric(chunk["STATUS"], errors="coerce")
-        chunk["BB_DELINQUENT"] = severity.between(1, 5).astype("int8")
-        chunk["BB_31_PLUS"] = severity.between(2, 5).astype("int8")
-        chunk["BB_61_PLUS"] = severity.between(3, 5).astype("int8")
-        chunk["BB_91_PLUS"] = severity.between(4, 5).astype("int8")
-        chunk["BB_CLEAN"] = chunk["STATUS"].eq("0").astype("int8")
-        chunk["BB_SEVERITY"] = severity.fillna(0)
+        chunk = bureau_balance_status_columns(chunk)
         chunk["BB_RECENT_DELINQUENT"] = (
             chunk["MONTHS_BALANCE"].ge(-5) & chunk["BB_DELINQUENT"].eq(1)
         ).astype("int8")
         partials.append(
             chunk.groupby("SK_ID_BUREAU", observed=True).agg(
                 BB_MONTH_COUNT=("MONTHS_BALANCE", "size"),
+                BB_STATUS_OBSERVED_MONTHS=("BB_STATUS_OBSERVED", "sum"),
                 BB_DELINQUENT_MONTHS=("BB_DELINQUENT", "sum"),
                 BB_31_PLUS_MONTHS=("BB_31_PLUS", "sum"),
                 BB_61_PLUS_MONTHS=("BB_61_PLUS", "sum"),
@@ -152,6 +182,7 @@ def bureau_balance_features(
     credit = credit.merge(bureau_map, on="SK_ID_BUREAU", how="left", validate="one_to_one")
     borrower = credit.groupby(ID_COL, observed=True).agg(
         BB_MONTH_COUNT=("BB_MONTH_COUNT", "sum"),
+        BB_STATUS_OBSERVED_MONTHS=("BB_STATUS_OBSERVED_MONTHS", "sum"),
         BB_DELINQUENT_MONTHS=("BB_DELINQUENT_MONTHS", "sum"),
         BB_31_PLUS_MONTHS=("BB_31_PLUS_MONTHS", "sum"),
         BB_61_PLUS_MONTHS=("BB_61_PLUS_MONTHS", "sum"),
@@ -161,8 +192,12 @@ def bureau_balance_features(
         BB_RECENT_DELINQUENT=("BB_RECENT_DELINQUENT", "max"),
         BB_CREDITS_EVER_DELINQUENT=("BB_CREDIT_EVER_DELINQUENT", "sum"),
     ).reset_index()
-    borrower["BB_DELINQUENT_MONTH_SHARE"] = safe_ratio(borrower["BB_DELINQUENT_MONTHS"], borrower["BB_MONTH_COUNT"])
-    borrower["BB_31_PLUS_MONTH_SHARE"] = safe_ratio(borrower["BB_31_PLUS_MONTHS"], borrower["BB_MONTH_COUNT"])
+    borrower["BB_DELINQUENT_STATUS_SHARE"] = safe_ratio(
+        borrower["BB_DELINQUENT_MONTHS"], borrower["BB_STATUS_OBSERVED_MONTHS"]
+    )
+    borrower["BB_31_PLUS_STATUS_SHARE"] = safe_ratio(
+        borrower["BB_31_PLUS_MONTHS"], borrower["BB_STATUS_OBSERVED_MONTHS"]
+    )
     audit = {
         "source": "bureau_balance",
         "input_rows": int(input_rows),
@@ -218,7 +253,6 @@ def installment_features(
     valid_ids = set(borrower_ids)
     partials = []
     input_rows = retained_rows = excluded_rows = outside_population = 0
-    keys = [ID_COL, "SK_ID_PREV", "NUM_INSTALMENT_VERSION", "NUM_INSTALMENT_NUMBER"]
     for chunk in iter_csv(raw_dir, "installments_payments.csv", chunksize):
         input_rows += len(chunk)
         chunk, audit = temporal_filter_installments(chunk)
@@ -227,16 +261,9 @@ def installment_features(
         outside_population += int((~in_population).sum())
         chunk = chunk.loc[in_population]
         retained_rows += len(chunk)
-        partials.append(
-            chunk.groupby(keys, observed=True, dropna=False).agg(
-                SCHEDULED_DAY=("DAYS_INSTALMENT", "min"),
-                PAYMENT_DAY=("DAYS_ENTRY_PAYMENT", "max"),
-                SCHEDULED_AMOUNT=("AMT_INSTALMENT", "max"),
-                PAYMENT_AMOUNT=("AMT_PAYMENT", "sum"),
-            ).reset_index()
-        )
+        partials.append(consolidate_installment_rows(chunk))
     schedule = pd.concat(partials, ignore_index=True)
-    schedule = schedule.groupby(keys, observed=True, dropna=False).agg(
+    schedule = schedule.groupby(INSTALLMENT_KEYS, observed=True, dropna=False).agg(
         SCHEDULED_DAY=("SCHEDULED_DAY", "min"),
         PAYMENT_DAY=("PAYMENT_DAY", "max"),
         SCHEDULED_AMOUNT=("SCHEDULED_AMOUNT", "max"),
@@ -325,8 +352,8 @@ def validate_feature_table(table: pd.DataFrame, expected_rows: int) -> None:
     if leaked_ids:
         raise AssertionError(f"Relationship identifiers entered the predictor table: {leaked_ids}")
     feature_count = len(table.columns) - 2
-    if not 60 <= feature_count <= MAX_FEATURES:
-        raise AssertionError(f"Feature count {feature_count} is outside the approved 60-{MAX_FEATURES} range")
+    if not 95 <= feature_count <= MAX_FEATURES:
+        raise AssertionError(f"Feature count {feature_count} is outside the approved 95-{MAX_FEATURES} range")
     numeric = table.select_dtypes(include=np.number)
     if np.isinf(numeric.to_numpy()).any():
         raise AssertionError("Feature table contains infinite values")

@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.optimize import minimize
 from sklearn.calibration import calibration_curve
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score, roc_curve
 
 
@@ -30,11 +30,29 @@ def ks_statistic(y_true, score) -> float:
 
 
 def calibration_slope_intercept(y_true, score) -> tuple[float, float]:
+    """Fit the two-parameter calibration model with a stable log-likelihood.
+
+    The previous near-unpenalized sklearn LogisticRegression fit emitted
+    overflow/invalid matrix warnings on this diagnostic.  This formulation uses
+    ``logaddexp`` and an analytic gradient, avoiding unstable probability/logit
+    arithmetic without suppressing warnings.
+    """
+    y = np.asarray(y_true, dtype=float)
     p = np.clip(np.asarray(score), 1e-6, 1 - 1e-6)
-    logit = np.log(p / (1 - p)).reshape(-1, 1)
-    model = LogisticRegression(C=1e6, solver="lbfgs")
-    model.fit(logit, np.asarray(y_true))
-    return float(model.coef_[0, 0]), float(model.intercept_[0])
+    score_logit = np.log(p) - np.log1p(-p)
+
+    def objective(beta):
+        linear = beta[0] + beta[1] * score_logit
+        value = np.logaddexp(0.0, linear).sum() - np.dot(y, linear)
+        residual = 1.0 / (1.0 + np.exp(-np.clip(linear, -35, 35))) - y
+        gradient = np.array([residual.sum(), np.dot(residual, score_logit)])
+        return value, gradient
+
+    result = minimize(objective, np.array([0.0, 1.0]), jac=True, method="BFGS")
+    if not result.success and np.linalg.norm(result.jac) > 1e-3:
+        raise RuntimeError(f"Calibration diagnostic failed: {result.message}")
+    intercept, slope = result.x
+    return float(slope), float(intercept)
 
 
 def metric_row(y_true, score, model: str, sample: str, calibrated: bool) -> dict:
@@ -180,7 +198,7 @@ def plot_calibration(y_true, predictions: Mapping[str, np.ndarray], output_path:
     ax.plot([0, limit], [0, limit], "--", color="grey", linewidth=1, label="Perfect calibration")
     ax.set_xlim(0, limit)
     ax.set_ylim(0, limit)
-    ax.set(xlabel="Mean predicted probability", ylabel="Observed bad rate", title="Final-test calibration by score decile")
+    ax.set(xlabel="Mean predicted probability", ylabel="Observed bad rate", title="Legacy-holdout calibration by score decile")
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
@@ -191,7 +209,7 @@ def plot_bad_rate_by_decile(deciles: pd.DataFrame, output_path: Union[Path, str]
     _style()
     fig, ax = plt.subplots(figsize=(8, 5))
     sns.barplot(data=deciles, x="risk_decile", y="observed_bad_rate", hue="model", ax=ax)
-    ax.set(xlabel="Risk decile (1 = highest predicted risk)", ylabel="Observed bad rate", title="Rank ordering on the locked final test")
+    ax.set(xlabel="Risk decile (1 = highest predicted risk)", ylabel="Observed bad rate", title="Rank ordering on the legacy holdout")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
