@@ -1,18 +1,30 @@
-# Credit Risk Default Prediction
+# Credit Risk Modeling & Validation — Home Credit
 
-This project tests how much pre-application credit and repayment history improves prediction of Home Credit's payment-difficulty outcome beyond application characteristics alone. The outcome is the competition label, not a Basel, legal, lifetime-default, or production PD definition.
+I built a borrower-level credit-risk workflow from **307,511 applications**, combining application data with four relational sources of credit and repayment history. The project compares an interpretable Logistic benchmark with a LightGBM challenger under nested validation. Primary outer-CV ROC-AUC rises from **0.6579** with application data alone to **0.7232** after adding history, then to **0.7534** with LightGBM. The highest-risk 10% of applicants capture **32.70%** of observed payment-difficulty events in outer CV.
 
-## Data scope
+## Key results
 
-The analysis uses 307,511 applications (24,825 events; 8.1%) and four relational sources: bureau records, monthly bureau status, previous applications, and installment payments. Raw CSVs stay local. The feature build enforces a day/month-0 cutoff and produces one row per `SK_ID_CURR`.
+| Model | Outer-CV ROC-AUC | PR-AUC | KS | Top-10% capture |
+|---|---:|---:|---:|---:|
+| Application-only Logistic | 0.6579 | 0.1455 | 0.2354 | 22.18% |
+| Full Logistic | 0.7232 | 0.2004 | 0.3319 | 29.21% |
+| LightGBM | **0.7534** | **0.2346** | **0.3786** | **32.70%** |
 
-Temporal checks excluded 17 bureau rows with a post-application credit update and 2,905 installment rows whose actual payment date was missing. Previous applications all occurred before day 0; bureau-balance months were all non-positive. Multiple payment rows for one scheduled installment are consolidated before borrower aggregation.
+Application data → historical behaviour → nonlinear model is the central comparison.
 
-## Feature architecture
+![ROC and precision-recall comparison](outputs/figures/roc_pr_model_comparison.png)
 
-The final candidate set has 99 predictors:
+## Business interpretation
 
-| Family | Features |
+Historical credit and repayment behaviour improves risk ranking by 0.0652 AUC over the application-only Logistic model. LightGBM adds another 0.0303, while Logistic remains useful as the transparency-first benchmark through standardized coefficients and cross-fold sign stability.
+
+The capacity analysis frames the scores as a workload decision. If a risk team can inspect only a fixed share of applicants, it can rank applicants by score and measure how much observed payment-difficulty risk is concentrated in that review queue. This avoids choosing an arbitrary probability cutoff without business cost assumptions.
+
+## Data and feature design
+
+The modelling table contains 24,825 events (8.1%) and 99 candidate predictors at one row per `SK_ID_CURR`.
+
+| Feature family | Predictors |
 |---|---:|
 | Application and affordability | 23 |
 | Bureau credit history | 19 |
@@ -20,41 +32,24 @@ The final candidate set has 99 predictors:
 | Previous applications | 22 |
 | Installment behaviour | 22 |
 
-The set is intentionally selective rather than a generic aggregation grid. It includes explicit no-history flags. `CODE_GENDER`, opaque `EXT_SOURCE` scores, raw `AMT_GOODS_PRICE`, relationship IDs, post-application lifecycle fields, and sentinel dates are excluded. Age and family status remain candidate predictors and receive subgroup checks; several retained fields can act as socioeconomic proxies, so this public-data exercise makes no fairness or legal-compliance claim.
+Historical records must be observable by the application date. The build applies day/month-0 filters, consolidates partial installment payments, and keeps denominator-aware delinquency rates and no-history flags. Relationship IDs and post-application fields do not enter the model.
 
-## Models and validation
+`TARGET` is Home Credit's payment-difficulty competition outcome; it is not a regulatory probability-of-default definition.
 
-Primary performance evidence comes from five-fold outer stratified cross-validation over all labelled applicants. Every outer fold keeps its validation rows outside preprocessing, tuning, and early stopping. The original stratified 80/20 split (`random_state=42`) is retained as a legacy holdout for continuity with the earlier project version; because that same population was evaluated previously, it is not treated as a pristine independent test.
+## Validation design
 
-- Logistic Regression: L2 penalty and a four-value `C` grid (`0.01`, `0.1`, `1`, `10`) selected by three inner folds. Numeric clipping, imputation, scaling, rare-category pooling, and encoding are refit within training partitions. Reference categories are explicit.
-- LightGBM: four restrained candidates. Candidate and best-iteration selection use an inner validation split inside each outer-training fold; the outer validation fold is scored only after refitting with the locked iteration. The internal ceiling is 1,200 trees. No Optuna, SHAP, or additional challenger families are used.
-- Calibration: outer out-of-fold raw scores are assessed with Brier score and calibration slope/intercept. No calibration transform is selected or applied.
-- Operations: risk deciles and fixed top-5%, top-10%, and top-20% review capacities are assigned by model score only, with deterministic tie handling.
+Primary performance evidence comes from five-fold outer stratified cross-validation across the full labelled population. Preprocessing, feature clipping, imputation, category handling, scaling, and model selection are fitted within training partitions.
 
-The application-only Logistic comparator is supporting evidence for the value of relational history, not a third production candidate.
+- Logistic `C` is selected from `0.01`, `0.1`, `1`, and `10` using three inner folds.
+- LightGBM candidate and iteration selection use an inner validation split inside each outer-training fold. Outer validation rows are used only for scoring the locked fold design.
+- Raw outer out-of-fold scores provide Brier and calibration slope/intercept diagnostics; no calibration transform is applied.
+- The model choice rule keeps LightGBM only when outer-CV AUC exceeds Logistic by at least 0.005.
 
-## Results
+The original stratified 80/20 split is retained as a **legacy holdout** for continuity with the earlier project version. Because that population had already been evaluated, outer CV is the primary evidence and the legacy result is a secondary comparison.
 
-Nested outer-CV means (standard deviation in parentheses):
+## Legacy-holdout review-capacity illustration
 
-| Model | ROC-AUC | PR-AUC | KS | Brier | Top-10% capture |
-|---|---:|---:|---:|---:|---:|
-| Application-only Logistic | 0.6579 (0.0038) | 0.1455 (0.0028) | 0.2354 (0.0087) | 0.07227 (0.00010) | 22.18% (0.43 pp) |
-| Full Logistic | 0.7232 (0.0012) | 0.2004 (0.0037) | 0.3319 (0.0023) | 0.06985 (0.00013) | 29.21% (0.46 pp) |
-| LightGBM | 0.7534 (0.0030) | 0.2346 (0.0030) | 0.3786 (0.0061) | 0.06824 (0.00014) | 32.70% (0.15 pp) |
-
-Legacy-holdout results on 61,503 applicants (secondary comparability evidence):
-
-| Model | ROC-AUC | Gini | PR-AUC | KS | Brier |
-|---|---:|---:|---:|---:|---:|
-| Logistic | 0.7248 | 0.4495 | 0.2029 | 0.3392 | 0.06974 |
-| LightGBM | 0.7552 | 0.5104 | 0.2371 | 0.3798 | 0.06809 |
-
-Historical features add 0.0652 outer-CV AUC to the Logistic benchmark relative to application-only inputs. LightGBM adds a further 0.0303 and remains the selected primary ranking model under the pre-existing 0.005 rule. Logistic remains the transparency-first alternative: its standardized coefficients are reported with five-fold sign stability, while the challenger uses gain importance.
-
-## Review capacity
-
-For the selected LightGBM model:
+On the 61,503-row legacy holdout, LightGBM records 0.7552 ROC-AUC. Its top decile captures 33.90% of observed events at 3.39× portfolio lift.
 
 | Review capacity | Applicants reviewed | Events captured | Capture | Observed event rate | Lift |
 |---|---:|---:|---:|---:|---:|
@@ -62,41 +57,28 @@ For the selected LightGBM model:
 | 10% | 6,151 | 1,683 | 33.90% | 27.36% | 3.39× |
 | 20% | 12,301 | 2,602 | 52.41% | 21.15% | 2.62× |
 
-These are prespecified workload scenarios, not optimized lending cutoffs. No costs or approval economics are assumed.
+These rows illustrate risk concentration at fixed review workloads; they are not lending cutoffs.
 
-![ROC and precision-recall comparison](outputs/figures/roc_pr_model_comparison.png)
-
-![Bad rate by risk decile](outputs/figures/bad_rate_by_decile.png)
-
-## Limitations
-
-- The legacy holdout was used by an earlier project iteration and is neither independent nor out-of-time evidence.
-- The public competition outcome and source population do not establish production lending suitability.
-- Age, family status, education, occupation, housing, and asset variables may encode sensitive or socioeconomic effects; subgroup diagnostics do not prove fairness.
-- LightGBM importance and penalized Logistic coefficients are associative, not causal.
-- Review-capacity results omit decision costs, policy constraints, reject inference, and portfolio drift.
+![Observed bad rate by risk decile](outputs/figures/bad_rate_by_decile.png)
 
 ## Repository structure
 
 ```text
-data/raw/                   local source CSVs and data instructions
-data/processed/             local, ignored feature and split artifacts
+data/raw/                   local source files and data instructions
+data/processed/             ignored borrower-level and split artifacts
 notebooks/01_data_audit.ipynb
 notebooks/02_feature_engineering.ipynb
 notebooks/03_model_development.ipynb
 notebooks/04_model_validation.ipynb
-src/data.py                 schemas and temporal filters
-src/features.py             five-family borrower aggregation
-src/modeling.py             nested outer CV and legacy-holdout fitting
-src/validation.py           risk metrics, deciles, capacity, figures
-tests/                      data-contract and validation tests
-outputs/tables/             generated validation tables
+src/                        data contracts, features, modelling, validation
+tests/                      methodology and data-contract tests
+outputs/tables/             generated analytical tables
 outputs/figures/            generated figures
 ```
 
 ## Reproduction
 
-Use the repository root as the working directory.
+Run from the repository root:
 
 ```bash
 python -m venv .venv
@@ -109,6 +91,14 @@ python -m jupyter nbconvert --execute --to notebook --inplace notebooks/03_model
 python -m jupyter nbconvert --execute --to notebook --inplace notebooks/04_model_validation.ipynb
 ```
 
-Place the six files listed in [`data/raw/README.md`](data/raw/README.md) before running. On macOS, LightGBM may also require `brew install libomp`. The processed borrower table, split IDs, fitted artifacts, and raw CSVs remain gitignored; all committed tables and figures are regenerated by the notebooks.
+Place the six files listed in [`data/raw/README.md`](data/raw/README.md) before running. On macOS, LightGBM may require `brew install libomp`. Raw data, processed borrower records, split IDs, and fitted artifacts remain local.
 
-Source tables: [`dataset_summary.csv`](outputs/tables/dataset_summary.csv), [`feature_family_summary.csv`](outputs/tables/feature_family_summary.csv), [`outer_cv_model_comparison.csv`](outputs/tables/outer_cv_model_comparison.csv), [`legacy_holdout_model_metrics.csv`](outputs/tables/legacy_holdout_model_metrics.csv), [`risk_decile_summary.csv`](outputs/tables/risk_decile_summary.csv), and [`capacity_analysis.csv`](outputs/tables/capacity_analysis.csv).
+Generated evidence: [`outer_cv_model_comparison.csv`](outputs/tables/outer_cv_model_comparison.csv), [`legacy_holdout_model_metrics.csv`](outputs/tables/legacy_holdout_model_metrics.csv), [`capacity_analysis.csv`](outputs/tables/capacity_analysis.csv), and [`feature_family_summary.csv`](outputs/tables/feature_family_summary.csv).
+
+## Limitations
+
+- The dataset does not provide external or out-of-time validation.
+- The 80/20 legacy holdout was evaluated in an earlier project version and is reported only for continuity.
+- The competition target is not a regulatory PD definition or evidence of production lending suitability.
+- Age, family status, education, occupation, housing, and asset variables may encode sensitive or socioeconomic effects; subgroup checks cannot establish fairness.
+- Coefficients and feature importance are associative, while review-capacity results omit lending economics, reject inference, policy constraints, and portfolio drift.
