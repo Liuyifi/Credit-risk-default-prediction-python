@@ -1,0 +1,45 @@
+{
+  "primary_validation": "5-fold outer StratifiedKFold over all labelled rows, shuffle=True, random_state=42",
+  "legacy_holdout": "previously used 80/20 split retained for comparability; not an independent test",
+  "inner_logistic": "3-fold StratifiedKFold inside each outer train",
+  "inner_lightgbm": "stratified 80/20 split inside each outer train for candidate and iteration selection",
+  "logistic_c": 0.1,
+  "lightgbm_params": {
+    "num_leaves": 15,
+    "max_depth": 5,
+    "min_child_samples": 100,
+    "learning_rate": 0.04,
+    "colsample_bytree": 0.8,
+    "subsample": 0.8,
+    "reg_alpha": 0.0,
+    "reg_lambda": 3.0
+  },
+  "lightgbm_iterations": 1114,
+  "calibration": {
+    "Application-only Logistic": {
+      "applied": false,
+      "raw_brier": 0.07226934126618353,
+      "slope": 0.9934058025410256,
+      "intercept": -0.01570042195501144
+    },
+    "Logistic": {
+      "applied": false,
+      "raw_brier": 0.06985212142165739,
+      "slope": 0.9912871653873263,
+      "intercept": -0.020233095847441124
+    },
+    "LightGBM": {
+      "applied": false,
+      "raw_brier": 0.06823807504770185,
+      "slope": 1.0163837731375482,
+      "intercept": 0.04143722037360989
+    }
+  },
+  "capacity_levels": [
+    0.05,
+    0.1,
+    0.2
+  ],
+  "primary_model": "LightGBM",
+  "primary_rule": "LightGBM only if outer CV AUC exceeds Logistic by at least 0.005; otherwise prefer transparency"
+}

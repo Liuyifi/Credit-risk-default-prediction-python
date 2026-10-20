@@ -1,10 +1,10 @@
 # Credit Risk Modeling & Validation — Home Credit
 
-I built a borrower-level credit-risk workflow from **307,511 applications**, combining application data with four relational sources of credit and repayment history. The project compares an interpretable Logistic benchmark with a LightGBM challenger under nested validation. Primary outer-CV ROC-AUC rises from **0.6579** with application data alone to **0.7232** after adding history, then to **0.7534** with LightGBM. The highest-risk 10% of applicants capture **32.70%** of observed payment-difficulty events in outer CV.
+I built a borrower-level credit-risk workflow from **307,511 applications**, combining application data with four relational sources of credit and repayment history. The project compares an interpretable Logistic benchmark with a LightGBM model under five-fold outer cross-validation and model-specific inner selection procedures. LightGBM is selected as the primary model because its outer-CV AUC exceeds Logistic by 0.0303, above the 0.005 rule threshold. Primary outer-CV ROC-AUC rises from **0.6579** with application data alone to **0.7232** after adding history, then to **0.7534** with LightGBM. The highest-risk 10% of applicants capture **32.70%** of observed payment-difficulty events in outer CV.
 
 ## Key results
 
-| Model | Outer-CV ROC-AUC | PR-AUC | KS | Top-10% capture |
+| Model | Outer-CV ROC-AUC | Average Precision (AP) | KS | Top-10% capture |
 |---|---:|---:|---:|---:|
 | Application-only Logistic | 0.6579 | 0.1455 | 0.2354 | 22.18% |
 | Full Logistic | 0.7232 | 0.2004 | 0.3319 | 29.21% |
@@ -14,6 +14,8 @@ Application data → historical behaviour → nonlinear model is the central com
 
 ![ROC and precision-recall comparison](outputs/figures/roc_pr_model_comparison.png)
 
+*These curves use the 61,503-row legacy holdout rather than the outer-CV out-of-fold scores shown above: Logistic AUC 0.725 / AP 0.203; LightGBM AUC 0.755 / AP 0.237.*
+
 ## Business interpretation
 
 Historical credit and repayment behaviour improves risk ranking by 0.0652 AUC over the application-only Logistic model. LightGBM adds another 0.0303, while Logistic remains useful as the transparency-first benchmark through standardized coefficients and cross-fold sign stability.
@@ -22,7 +24,7 @@ The capacity analysis frames the scores as a workload decision. If a risk team c
 
 ## Data and feature design
 
-The modelling table contains 24,825 events (8.1%) and 99 candidate predictors at one row per `SK_ID_CURR`.
+The modelling table contains 24,825 events (8.1%) and 99 source predictor fields at one row per `SK_ID_CURR`. All 99 enter both model pipelines; categorical encoding expands the Logistic design matrix to 135 transformed columns.
 
 | Feature family | Predictors |
 |---|---:|
@@ -66,6 +68,7 @@ These rows illustrate risk concentration at fixed review workloads; they are not
 ```text
 data/raw/                   local source files and data instructions
 data/processed/             ignored borrower-level and split artifacts
+models/                     design lock; fitted models and caches ignored
 notebooks/01_data_audit.ipynb
 notebooks/02_feature_engineering.ipynb
 notebooks/03_model_development.ipynb
@@ -77,6 +80,8 @@ outputs/figures/            generated figures
 ```
 
 ## Reproduction
+
+Place the six files listed in [`data/raw/README.md`](data/raw/README.md) before running anything. The test suite and the first notebook read those raw files directly, so both `pytest` and notebook 01 need them in place; the six files total about 1.84 GB (1.71 GiB).
 
 Run from the repository root:
 
@@ -91,7 +96,7 @@ python -m jupyter nbconvert --execute --to notebook --inplace notebooks/03_model
 python -m jupyter nbconvert --execute --to notebook --inplace notebooks/04_model_validation.ipynb
 ```
 
-Place the six files listed in [`data/raw/README.md`](data/raw/README.md) before running. On macOS, LightGBM may require `brew install libomp`. Raw data, processed borrower records, split IDs, and fitted artifacts remain local.
+On macOS, LightGBM may require `brew install libomp`. Raw data, processed borrower records, split IDs, and fitted artifacts remain local. The auditable design lock is kept at `models/design_lock.json`.
 
 Generated evidence: [`outer_cv_model_comparison.csv`](outputs/tables/outer_cv_model_comparison.csv), [`legacy_holdout_model_metrics.csv`](outputs/tables/legacy_holdout_model_metrics.csv), [`capacity_analysis.csv`](outputs/tables/capacity_analysis.csv), and [`feature_family_summary.csv`](outputs/tables/feature_family_summary.csv).
 
@@ -100,5 +105,5 @@ Generated evidence: [`outer_cv_model_comparison.csv`](outputs/tables/outer_cv_mo
 - The dataset does not provide external or out-of-time validation.
 - The 80/20 legacy holdout was evaluated in an earlier project version and is reported only for continuity.
 - The competition target is not a regulatory PD definition or evidence of production lending suitability.
-- Age, family status, education, occupation, housing, and asset variables may encode sensitive or socioeconomic effects; subgroup checks cannot establish fairness.
+- Age, family status, education, occupation, housing, and asset variables are used as predictors and may encode sensitive or socioeconomic effects. Subgroup diagnostics are reported on the legacy holdout for age band and family status; they do not establish fairness or compliance.
 - Coefficients and feature importance are associative, while review-capacity results omit lending economics, reject inference, policy constraints, and portfolio drift.

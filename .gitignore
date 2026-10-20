@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
 
 # Local configuration and secrets
 .env
@@ -21,7 +22,8 @@ data/processed/*
 !data/processed/README.md
 
 # Local fitted models and caches are not portfolio artifacts
-models/
+models/*
+!models/design_lock.json
 *.pkl
 *.joblib
 
